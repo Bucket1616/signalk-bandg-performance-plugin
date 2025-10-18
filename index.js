@@ -909,6 +909,52 @@ module.exports = function (app) {
     try { ydgwTx && ydgwTx.stop() } catch (e) {}
   }
 
+  // -------------------------------------------------------------------------
+  // Plugin configuration schema (restored)
+  // -------------------------------------------------------------------------
+  plugin.schema = {
+    type: 'object',
+    properties: {
+      connectionType: {
+        type: 'string',
+        title: 'Connection Type',
+        enum: ['canbus', 'canboat'],
+        default: 'canboat'
+      },
+      transport: {
+        type: 'string',
+        title: 'Transport Type',
+        enum: ['socketcan', 'ydwg-raw'],
+        default: 'ydwg-raw'
+      },
+      emulate: {
+        type: 'boolean',
+        title: 'Enable H5000 Emulation',
+        default: true
+      },
+      host: {
+        type: 'string',
+        title: 'YDWG Host',
+        default: '127.0.0.1'
+      },
+      port: {
+        type: 'number',
+        title: 'YDWG Port',
+        default: 1457
+      },
+      sourceAddress: {
+        type: 'number',
+        title: 'Source Address (N2K)',
+        default: 14
+      },
+      candevice: {
+        type: 'string',
+        title: 'CAN Device (if using socketcan)',
+        default: ''
+      }
+    }
+  }
+
   return plugin
 }
 
