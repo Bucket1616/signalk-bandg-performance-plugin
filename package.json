@@ -26,5 +26,11 @@
   "dependencies": {
     "@canboat/canboatjs": "^1.27.0",
     "lodash": "^4.17.21"
+  },
+  "signalk": {
+    "appVersion": ">=2.0.0",
+    "plugins": {
+      "nmea2000out": true
+    }
   }
 }
