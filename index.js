@@ -1,11 +1,11 @@
-//# This works, but the PGNS are going out as if the YDWG-02 is the source, instead of
-//# a phantom H5000 device.
-
 const util = require('util')  
 const _ = require('lodash')  
 var globalOptions = []  
 const performancePGN = '%s,3,130824,%s,255,%s,7d,99'  
-const keepAlivePGN = '%s,7,65305,%s,255,8,41,9f,01,17,1c,01,00,00'  
+// Variable for sending the Identity broadcast perodically (every 5 seconds / 10 Performance broadcasts)
+let lastIdentityBroadcast = 0;
+let identitySeqCounter = 0;
+let identityCycleCount = 0; // Anchored safely at the root level
   
 module.exports = function (app) {  
   var plugin = {}  
@@ -41,8 +41,8 @@ module.exports = function (app) {
       sourceAddress: {  
         type: "number",  
         title: "Source device ID for B&G H5000 emulation",  
-        default: 14,
-        description: "NMEA2000 source address (0-251). Default is 14."
+        default: 55,
+        description: "NMEA2000 source address (0-251, 36-55 prefered). Default is 55."
       },  
         
     }  
@@ -689,31 +689,77 @@ module.exports = function (app) {
     }  
   }  
   
-function sendN2k ( msg) {
-  // Determine emulation mode (support legacy 'emulate' option)
-  const mode = globalOptions.emulationMode || 'standard'
-	
-  if (mode === 'canbus') {
-    // 1. Direct CANbus mode - Uses native canboatjs bindings
-    if (simpleCan && typeof simpleCan.sendPGN === 'function') {
-      simpleCan.sendPGN(msg)
-    } else {
-      app.error('SimpleCan is not active or initialized')
-    }
-  } 
-  else if (mode === 'ydwg02' || mode === 'standard') {
-    // 2. Process-Safe Emission Mode
-    // Directly bridges sandboxed child processes to physical network streams
-    if (app.emit) {
-      app.emit('nmea2000out', msg)
-      app.debug(`Emitted string via safely bound pipeline (${mode}): ${msg}`)
-    } else {
-      app.error('app.emit is completely unavailable in this sandboxed server context')
+
+
+  let lastIdentityBroadcast = 0;
+  let identitySeqCounter = 0; // Dynamic tracking counter (0-7 loop)
+
+  // Clean, isolated helper routine for Strategy A identity streaming
+  function streamIdentityFrames(srcAddress) {
+    try {
+      const timestamp = new Date().toISOString();
+
+      // A. ISO Address Claim (PGN 60928) - Solid single frame
+      const rawAddressClaim = `${timestamp},6,60928,${srcAddress},255,8,50,06,82,04,00,82,00,c0`;
+
+      // B. Aligned Product Information (PGN 126996) - Fixed static sequence loop (base 20-2b)
+      // This matches your working baseline data length exactly!
+      const rawProductInfo = [
+        `${timestamp},6,126996,${srcAddress},255,8,20,35,08,c6,11,48,35,30`, // "H50"
+        `${timestamp},6,126996,${srcAddress},255,8,21,30,30,20,43,50,55,00`, // "00 CPU\0"
+        `${timestamp},6,126996,${srcAddress},255,8,22,00,00,00,00,00,00,00`, 
+        `${timestamp},6,126996,${srcAddress},255,8,23,00,00,00,00,31,2e,30`, // "1.0"
+        `${timestamp},6,126996,${srcAddress},255,8,24,2e,32,39,00,00,00,00`, // ".29\0"
+        `${timestamp},6,126996,${srcAddress},255,8,25,00,00,00,00,50,65,72`, // "Per"
+        `${timestamp},6,126996,${srcAddress},255,8,26,66,6f,72,6d,61,6e,63`, // "formance"
+        `${timestamp},6,126996,${srcAddress},255,8,27,65,20,76,32,00,00,00`, // " v2\0"
+        `${timestamp},6,126996,${srcAddress},255,8,28,00,00,00,00,42,4b,54`, // "BKT"
+        `${timestamp},6,126996,${srcAddress},255,8,29,2d,31,36,31,36,00,00`, // "-1616\0"
+        `${timestamp},6,126996,${srcAddress},255,8,2a,00,00,00,00,00,00,01`,
+        `${timestamp},6,126996,${srcAddress},255,4,2b,01,00,00`
+      ];
+
+      if (app.emit) {
+        app.emit('nmea2000out', rawAddressClaim);
+        
+        // Output the 12 fast-packet rows with precise 7ms spacing
+        rawProductInfo.forEach((frame, idx) => {
+          setTimeout(() => {
+            app.emit('nmea2000out', frame);
+          }, 10 + (idx * 7));
+        });
+      }
+      
+      app.debug(`Strategy A: Identity transmission flight dispatched for Address ${srcAddress}`);
+    } catch (identityErr) {
+      app.error(`Identity registration failure: ${identityErr.message}`);
     }
   }
-}
- 
-  
+  // Core sendN2k routing strictly for live performance calculations
+  function sendN2k (msg) {
+    if (!msg || msg.includes('undefined')) {
+      return;
+    }
+
+    const mode = globalOptions.emulationMode || 'standard'
+
+    if (mode === 'canbus') {
+      if (simpleCan && typeof simpleCan.sendPGN === 'function') {
+        simpleCan.sendPGN(msg)
+      } else {
+        app.error('SimpleCan is not active or initialised')
+      }
+    } 
+    else if (mode === 'ydwg02' || mode === 'standard') {
+      if (app.emit) {
+        app.emit('nmea2000out', msg);
+      } else {
+        app.error('app.emit is completely unavailable in this sandboxed server context')
+      }
+    }
+  }
+
+
   function updateSchema() {  
     Object.keys(supportedValues).forEach(key => {  
       let defaultPath = supportedValues[key]['defaultPath']  
@@ -842,23 +888,28 @@ function sendN2k ( msg) {
       app.setPluginStatus(`Standard mode - Using source address ${sourceAddress}`)
       app.debug('Standard mode: Sending via nmea2000out')
     }
-  
-    function sendKeepAlive () {  
-      let msg = util.format(keepAlivePGN, (new Date()).toISOString(), sourceAddress)  
-      sendN2k(msg)  
-    }  
-  
+
     timers.push(setInterval(() => {  
-      sendPerformance()   
-    }, 500))  
-     
-    if (mode === 'canbus' || mode === 'ydwg02') {
-      // Send keep-alive for both direct CANbus and YDWG-02 modes
-      timers.push(setInterval(() => {  
-        sendKeepAlive();  
-      }, 1000))  
-    }
-  
+      // 1. Always calculate and transmit live performance metrics first
+      sendPerformance();
+      
+      const mode = globalOptions.emulationMode || 'standard';
+      const srcAddress = globalOptions.sourceAddress || 55;
+
+      // 2. Safely increment our global parent tracking counter
+      identityCycleCount++;
+
+      // 3. Exactly on every 10th cycle (5 seconds), fire the Identity block
+      if ((mode === 'ydwg02' || mode === 'standard') && identityCycleCount >= 10) {
+        identityCycleCount = 0; // Clear the gate counter for the next run
+
+        // Post-Performance Delay: Anchor the identity frames exactly 50ms after the burst
+        setTimeout(() => {
+          streamIdentityFrames(srcAddress);
+        }, 50);
+      }
+    }, 500));
+      
   }  
   
   
