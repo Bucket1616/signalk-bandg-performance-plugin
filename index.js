@@ -33,11 +33,6 @@ module.exports = function (app) {
         enum: ["standard", "canbus", "ydwg02"],
         enumNames: ["Standard (nmea2000out)", "Direct CANbus (H5000 emulation)", "YDWG-02 Gateway (H5000 via gateway)"]
       },
-      emulate: {  
-        type: "boolean",  
-        title: "[DEPRECATED] Enable B&G H5000 device emulation (use Emulation Mode instead)",
-        description: "This option is deprecated. Please use 'Emulation Mode' setting above."
-      },  
       candevice: {  
         type: "string",  
         title: "CANbus device to use for direct emulation (leave empty for autodetect)",
@@ -696,13 +691,8 @@ module.exports = function (app) {
   
 function sendN2k ( msg) {
   // Determine emulation mode (support legacy 'emulate' option)
-  let mode = globalOptions.emulationMode || 'standard'
-
-  // Handle legacy emulate boolean option
-  if (globalOptions.emulate === true && mode === 'standard') {
-    mode = 'canbus'
-  }
-
+  const mode = globalOptions.emulationMode || 'standard'
+	
   if (mode === 'canbus') {
     // 1. Direct CANbus mode - Uses native canboatjs bindings
     if (simpleCan && typeof simpleCan.sendPGN === 'function') {
