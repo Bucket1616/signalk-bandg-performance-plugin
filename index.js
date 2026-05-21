@@ -694,29 +694,35 @@ module.exports = function (app) {
     }  
   }  
   
-  function sendN2k (msg) {  
-    // app.debug('Msg: %s', msg)  
-    
-    // Determine emulation mode (support legacy 'emulate' option)
-    let mode = globalOptions.emulationMode || 'standard'
-    
-    // Handle legacy emulate boolean option
-    if (globalOptions.emulate === true && mode === 'standard') {
-      mode = 'canbus'
-    }
-    
-    if (mode === 'canbus') {
-      // Direct CANbus mode - use SimpleCan
+function sendN2k ( msg) {
+  // Determine emulation mode (support legacy 'emulate' option)
+  let mode = globalOptions.emulationMode || 'standard'
+
+  // Handle legacy emulate boolean option
+  if (globalOptions.emulate === true && mode === 'standard') {
+    mode = 'canbus'
+  }
+
+  if (mode === 'canbus') {
+    // 1. Direct CANbus mode - Uses native canboatjs bindings
+    if (simpleCan && typeof simpleCan.sendPGN === 'function') {
       simpleCan.sendPGN(msg)
-    } else if (mode === 'ydwg02') {
-      // YDWG-02 Gateway mode - emit with source address override
-      app.emit('nmea2000out', msg)
-      app.debug('Sent via nmea2000out for YDWG-02: %s', msg)
     } else {
-      // Standard mode - normal nmea2000out
-      app.emit('nmea2000out', msg)
+      app.error('SimpleCan is not active or initialized')
     }
-  }  
+  } 
+  else if (mode === 'ydwg02' || mode === 'standard') {
+    // 2. Process-Safe Emission Mode
+    // Directly bridges sandboxed child processes to physical network streams
+    if (app.emit) {
+      app.emit('nmea2000out', msg)
+      app.debug(`Emitted string via safely bound pipeline (${mode}): ${msg}`)
+    } else {
+      app.error('app.emit is completely unavailable in this sandboxed server context')
+    }
+  }
+}
+ 
   
   function updateSchema() {  
     Object.keys(supportedValues).forEach(key => {  
