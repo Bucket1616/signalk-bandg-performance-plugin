@@ -67,26 +67,33 @@ module.exports = function (app) {
   // Helper: internal sendN2k via Signal K app.handleMessage()
   // ==========================================================================
   function sendN2k (pgn, fields) {
-    try {
-      const msg = {
-        pgn,
-        dst: 255,
-        src: options.sourceAddress || 14,
-        prio: 3,
-        fields
-      }
-      app.handleMessage(plugin.id, {
-        updates: [{
-          source: { label: 'bandg-performance' },
-          timestamp: new Date().toISOString(),
-          values: [{ path: '', value: msg }]
-        }]
-      })
-      app.debug(`B&G Performance → sent PGN ${pgn}`)
-    } catch (err) {
-      app.error(`Error sending PGN ${pgn}: ${err.message}`)
+  try {
+    // 1. Build the target layout for canboatjs
+    const n2kMsg = {
+      pgn,
+      dst: 255,
+      src: options.sourceAddress || 14,
+      prio: 3,
+      fields
     }
+
+    // 2. Convert the JSON object into a raw Actisense string format
+    // This uses the canboatjs library already loaded on line 11
+    const actisenseString = canboatjs.toActisenseSerialFormat(n2kMsg);
+
+    // 3. Emit across the process boundary to the YDWG-02 gateway
+    if (app.emit) {
+      app.emit('nmea2000out', actisenseString);
+      app.debug(`B&G Performance → Emitted raw string: ${actisenseString}`);
+    } else {
+      app.error('app.emit is not available in this server context');
+    }
+
+  } catch (err) {
+    app.error(`Error formatting/sending PGN ${pgn}: ${err.message}`)
   }
+}
+
 
   // ==========================================================================
   // Emulation logic
