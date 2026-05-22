@@ -1,53 +1,32 @@
-const util = require('util')  
-const _ = require('lodash')  
-var globalOptions = []  
-const performancePGN = '%s,3,130824,%s,255,%s,7d,99'  
-// Variable for sending the Identity broadcast perodically (every 5 seconds / 10 Performance broadcasts)
+const _ = require('lodash');
+const util = require('util');
+
+const performancePGN = "%s,3,130824,%s,255,%s,7d,99";
+const performancePGN_2 = "%s,3,130824,%s,255,%s,7d,99";
+
+// --- GLOBAL STATE MACHINE & TRACKING SCOPE ---
 let lastIdentityBroadcast = 0;
 let identitySeqCounter = 0;
-let identityCycleCount = 0; // Anchored safely at the root level
-  
-module.exports = function (app) {  
-  var plugin = {}  
-  var unsubscribes = []  
-  var timers = []  
-  var sourceAddress = 1  
-  var simpleCan  
-  
+let identityCycleCount = 0;
+
+let currentAddress = 36;       // Running address candidate
+let addressClaimed = false;    // Lock flag once address is won
+let searchCeiling = 59;        // Strict ceiling boundary
+let handshakeTimer = null;     // Handles the 2-second Wi-Fi silent gate
+let incomingListenerActive = false; // Flag to prevent double listener attachment
+// ---------------------------------------------
+
+module.exports = function (app) {
+  const plugin = {};
+  let timers = [];
+  let globalOptions = {};
+  let simpleCan = null;
+
   plugin.id = 'signalk-bandg-performance-plugin';  
   plugin.name = 'B&G performance PGN plugin';  
   plugin.description = 'Send B&G performance PGNs to display on Vulcan/Zeus/Triton2';  
   
-  var schema = {  
-    // The plugin schema  
-    properties: {  
-      'null': {  
-        'title': 'Select which data to send and what to use as path and source device. Source device can be specified when a path has multiple value sources. For explanations of the data you can check the B&G H5000 Operation manual here:\nhttps://softwaredownloads.navico.com/BG/downloads/documents/H5000_OM_EN_988-10630-002_w.pdf',  
-        'type': 'null',  
-      },  
-      emulationMode: {
-        type: "string",
-        title: "Emulation Mode",
-        description: "Select how to send B&G H5000 data",
-        default: "standard",
-        enum: ["standard", "canbus", "ydwg02"],
-        enumNames: ["Standard (nmea2000out)", "Direct CANbus (H5000 emulation)", "YDWG-02 Gateway (H5000 via gateway)"]
-      },
-      candevice: {  
-        type: "string",  
-        title: "CANbus device to use for direct emulation (leave empty for autodetect)",
-        description: "Only used when Emulation Mode is set to 'Direct CANbus'"
-      },  
-      sourceAddress: {  
-        type: "number",  
-        title: "Source device ID for B&G H5000 emulation",  
-        default: 55,
-        description: "NMEA2000 source address (0-251, 36-55 prefered). Default is 55."
-      },  
-        
-    }  
-  }  
-  
+
   let supportedValues = {  
   
     'avgTrueWindDirection': {  
@@ -584,7 +563,404 @@ module.exports = function (app) {
   
   };  
   
+
+  // --- STATE 1 & 2: PROACTIVE DYNAMIC ADDRESS STATE MACHINE ---
+  function initiateAddressClaimSequence() {
+    if (addressClaimed) return;
+
+    const mode = globalOptions.emulationMode || 'ydwg02';
+    if (mode === 'canbus') {
+      addressClaimed = true;
+      executePostClaimIdentityFlight();
+      startPerformanceStreams();
+      return;
+    }
+
+    if (handshakeTimer) clearTimeout(handshakeTimer);
+
+    const timestamp = new Date().toISOString();
+    
+    // A. ISO Address Claim (PGN 60928) for our candidate
+    const rawAddressClaim = `${timestamp},6,60928,${currentAddress},255,8,50,06,82,04,00,82,00,c0`;
+
+    // B. NEW PROACTIVE NETWORK INTERROGATION: ISO Request (PGN 59904) for Address Claims (0EE00 hex)
+    // This forces EVERY silent device on the boat to immediately broadcast its address position!
+    const networkQueryRequest = `${timestamp},6,59904,${currentAddress},255,3,00,ee,00`;
+
+    if (app.emit) {
+      // Shout our claim and instantly demand everyone else claim their slots
+      app.emit('nmea2000out', rawAddressClaim);
+      setTimeout(() => {
+        app.emit('nmea2000out', networkQueryRequest);
+        app.debug(`State Machine: Sent proactive network challenge query from Candidate [${currentAddress}]`);
+      }, 5);
+    }
+
+    // STATE 1: Open the 2-second safety window. Any silent collision will now wake up and trigger State 2
+    handshakeTimer = setTimeout(() => {
+      addressClaimed = true;
+      console.log(`[B&G Performance] State Machine: Address [${currentAddress}] SUCCESSFULLY CLAIMED and secured.`);
+      
+      globalOptions.currentAddress = currentAddress;
+      if (typeof app.savePluginOptions === 'function') {
+        app.savePluginOptions(globalOptions, () => {
+          app.debug('State Machine: Winning address configurations saved persistently.');
+        });
+      }
+
+      executePostClaimIdentityFlight();
+      startPerformanceStreams();
+    }, 2000); 
+  }
+
+
+  // Hook into sandboxed incoming events to check for node collisions
+  function attachIncomingNetworkListener() {
+    if (incomingListenerActive) return;
+
+    // FIX: Changed event hook name to 'nmea2000In' to align with modern core architecture
+    app.on('nmea2000In', (n2k) => {
+      if (addressClaimed) return; // Ignore incoming network traffic once address is secured
+
+      // Extract the raw source address integer out of the Signal K update metadata wrapper
+      let incomingSrc = null;
+      if (n2k && n2k.updates && n2k.updates[0] && n2k.updates[0].source) {
+        incomingSrc = n2k.updates[0].source.src;
+      }
+
+      // If another physical device on the backbone is using our candidate address, trigger State 2
+      if (incomingSrc !== null && incomingSrc === currentAddress) {
+        app.warn(`State Machine: COLLISION DETECTED! Another device is using address [${currentAddress}].`);
+        
+        // STATE 2: COLLIDE - Clear safety clocks, step up to next candidate address slot
+        if (handshakeTimer) clearTimeout(handshakeTimer);
+        currentAddress++;
+
+        if (currentAddress > searchCeiling) {
+          app.error(`State Machine: CRITICAL CEILING FAILURE - Network range 36-${searchCeiling} is completely full. Cannot claim device ID.`);
+          return; // Halt completely to protect boat hardware from data loops
+        }
+
+        // Loop back to State 1 with the next address candidate slot
+        initiateAddressClaimSequence();
+      }
+    });
+
+    incomingListenerActive = true;
+    app.debug('State Machine: Process-isolated network listener successfully attached to nmea2000In.');
+  }
+
+  // --- STATE 3: IDENTIFICATION FLIGHT ---
+  function executePostClaimIdentityFlight() {
+    try {
+      const timestamp = new Date().toISOString();
+      // identitySeqCounter is the 3-bit sequence ID for the Fast Packet message
+      // It must be incremented per *message*, not per frame.
+      // So, store current sequence ID for this message, then increment for the next message.
+      const currentSeqId = identitySeqCounter; 
+      identitySeqCounter = (identitySeqCounter + 1) % 8; 
+
+      // Helper to pad strings to exactly 32 bytes
+      function getPaddedString(str) {
+        let arr = Array(32).fill(0); // Fill with null bytes
+        for (let i = 0; i < str.length && i < 32; i++) {
+          arr[i] = str.charCodeAt(i);
+        }
+        return arr;
+      }
+
+      // Build the strict 134-byte payload for PGN 126996
+      let payload = [];
+      payload.push(0x35, 0x08); // NMEA Version 2101 (0x0835)
+      payload.push(0xc6, 0x11); // Product Code 4550 (0x11C6)
+      payload = payload.concat(getPaddedString("H5000 CPU"));
+      payload = payload.concat(getPaddedString("2.0.45"));
+      payload = payload.concat(getPaddedString("Performance v2"));
+      payload = payload.concat(getPaddedString("BKT-1616"));
+      payload.push(0x01); // Certification Level
+      payload.push(0x01); // Load Equivalency
+
+      const totalBytes = payload.length; // Should be 134 (0x86)
+
+      let frames = [];
+      let payloadIdx = 0; // Index into the full payload array
+      let frameIdx = 0;   // Index of the current Fast Packet frame (0-N)
+
+      while (payloadIdx < totalBytes) {
+        let frameDataBytes = []; // The actual data bytes for this frame (max 7)
+        let tpControlByteValue; // The value of the Fast Packet Control Byte
+
+        if (frameIdx === 0) {
+          // *** CRITICAL CHANGE HERE FOR THE FIRST FRAME ***
+          // Fast Packet Control Byte contains total message length (lower 5 bits) AND sequence ID (upper 3 bits)
+          tpControlByteValue = (currentSeqId << 5) | (totalBytes & 0x1F); 
+          
+          // Add up to 6 bytes of actual payload to this frame.
+          // The control byte effectively uses one of the 7 data slots in the first frame.
+          for (let i = 0; i < 6 && payloadIdx < totalBytes; i++) {
+            frameDataBytes.push(payload[payloadIdx++].toString(16).padStart(2, '0'));
+          }
+        } else {
+          // Subsequent frames: Control Byte contains frame index (lower 5 bits) AND sequence ID (upper 3 bits)
+          tpControlByteValue = (currentSeqId << 5) | (frameIdx & 0x1F);
+          
+          // Add up to 7 bytes of actual payload to this frame
+          for (let i = 0; i < 7 && payloadIdx < totalBytes; i++) {
+            frameDataBytes.push(payload[payloadIdx++].toString(16).padStart(2, '0'));
+          }
+        }
+
+        // Pad with 'ff' if this is the last frame and it's not full (common for Actisense string format)
+        while (frameDataBytes.length < 7 && payloadIdx >= totalBytes) { 
+            frameDataBytes.push('ff');
+        }
+
+        const tpControlByteHex = tpControlByteValue.toString(16).padStart(2, '0');
+        const dataStr = frameDataBytes.join(',');
+        
+        // *** CRITICAL CHANGE HERE: tpControlByteHex is the *only* control byte emitted ***
+        // We do NOT add totalBytes as a separate data byte.
+        frames.push(`${timestamp},6,126996,${currentAddress},255,8,${tpControlByteHex},${dataStr}`);
+        frameIdx++;
+      }
+
+      // Dispatch frames
+      if (app.emit) {
+        frames.forEach((frame, idx) => {
+          setTimeout(() => {
+            app.emit('nmea2000out', frame);
+          }, idx * 7); 
+        });
+        app.debug(`State Machine: Identity broadcast flight dispatched over won address [${currentAddress}]`);
+      }
+    } catch (err) {
+      app.error(`Identity configuration compilation error: ${err.message}`);
+    }
+  }
+
+
+  // --- STATE 4: DATA OPERATIONAL PHASE ---
+  function startPerformanceStreams() {
+    app.debug('State Machine: Handshake complete. Activating twice-a-second calculation engines.');
+    
+    timers.push(setInterval(() => {  
+      // 1. Always execute live boat calculation frames first
+      sendPerformance();
+      
+      const mode = globalOptions.emulationMode || 'ydwg02';
+      identityCycleCount++;
+
+      // 2. Strategy A Logic: Trigger identity updates exactly on the 10th loop tick (5 seconds)
+      if ((mode === 'ydwg02' || mode === 'standard') && identityCycleCount >= 10) {
+        identityCycleCount = 0; // Clear the gate counter
+
+        // Post-Performance Delay Anchor: Wait 50ms for performance buffers to pass before identity streams
+        setTimeout(() => {
+          executePostClaimIdentityFlight();
+        }, 50);
+      }
+    }, 500));
+  }
+
+  plugin.start = function (options, restartData) {
+    app.debug('Plugin starting...');
+    globalOptions = options;
+    
+    // Ensure parameters match boundaries, falling back safely if undefined
+    currentAddress = options.currentAddress || 36;
+    if (currentAddress < 36 || currentAddress > searchCeiling) {
+      currentAddress = 36; // Fallback check to reset edge cases
+    }
+    
+    addressClaimed = false;
+    identityCycleCount = 0;
+
+    // Bind components based on chosen output channel configuration
+    if (options.emulationMode === 'canbus') {
+      try {
+        const SimpleCan = require('@canboat/canboatjs').SimpleCan;
+        simpleCan = new SimpleCan({
+          app: app,
+          canInterface: options.canInterface || 'can0', // Dynamically loads user value!
+          addressClaim: {
+            'Unique Number': 1616,
+            'Manufacturer Code': 'Navico',
+            'Device Function': 130,
+            'Device Class': 85
+          },
+          productInfo: {
+            'NMEA 2000 Version': 2101,
+            'Product Code': 4550,
+            'Model ID': 'H5000 CPU',
+            'Software Version Code': '2.0.45',
+            'Model Version': 'Performance v2',
+            'Model Serial Code': 'BKT-1616'
+          }
+        });
+        simpleCan.start();
+      } catch (canErr) {
+        app.error(`Failed to initialize native CAN layer: ${canErr.message}`);
+      }
+    }
+
+    // Activate the State Machine Lifecycle Hooks
+    attachIncomingNetworkListener();
+    initiateAddressClaimSequence();
+  };
+
+  plugin.stop = function () {
+    app.debug('Plugin stopping...');
+    if (handshakeTimer) clearTimeout(handshakeTimer);
+    timers.forEach(clearInterval);
+    timers = [];
+    if (simpleCan && typeof simpleCan.stop === 'function') {
+      simpleCan.stop();
+    }
+    addressClaimed = false;
+    app.debug('Plugin safely deactivated.');
+  };
+
   
+  // Dedicated data-delivery routing engine 
+  function sendN2k (msg) {
+    if (!msg || msg.includes('undefined')) {
+      return;
+    }
+
+    const mode = globalOptions.emulationMode || 'ydwg02';
+
+    if (mode === 'canbus') {
+      if (simpleCan && typeof simpleCan.sendPGN === 'function') {
+        simpleCan.sendPGN(msg);
+      }
+    } 
+    else if (mode === 'ydwg02' || mode === 'standard') {
+      if (app.emit) {
+        // Stamp data using our dynamically determined, verified winning address
+        const realignedMsg = msg.replace(/,126996,\d+,/, `,126996,${currentAddress},`)
+                                .replace(/,130824,\d+,/, `,130824,${currentAddress},`);
+        app.emit('nmea2000out', realignedMsg);
+      }
+    }
+  }
+
+  
+   plugin.schema = function() {
+    // Construct the base schema each time it's requested
+    let generatedSchema = {
+      properties: {
+        'null': {
+          'title': 'Select which data to send and what to use as path and source device. Source device can be specified when a path has multiple value sources. For explanations of the data you can check the B&G H5000 Operation manual here:\nhttps://softwaredownloads.navico.com/BG/downloads/documents/H5000_OM_EN_988-10630-002_w.pdf',
+          'type': 'null',
+        },
+        emulationMode: {
+          type: "string",
+          title: "Emulation Mode",
+          description: "Select how to send B&G H5000 data",
+          default: "standard",
+          enum: ["standard", "canbus", "ydwg02"],
+          enumNames: ["Standard (nmea2000out)", "Direct CANbus (H5000 emulation)", "YDWG-02 Gateway (H5000 via gateway)"]
+        },
+        canInterface: {
+          type: "string",
+          title: "CANbus device to use for direct emulation (leave empty for autodetect)",
+          description: "Only used when Emulation Mode is set to 'Direct CANbus'"
+        },
+        currentAddress: { // Corrected from currentddress
+          type: "number",
+          title: "Source device ID for B&G H5000 emulation",
+          default: 55,
+          description: "NMEA2000 source address (0-251, 36-55 prefered). Default is 55."
+        },
+      }
+    };
+
+    // Dynamically add all supportedValues to the schema's properties
+    Object.keys(supportedValues).forEach(key => {
+      let defaultPath = supportedValues[key]['defaultPath'];
+      if (defaultPath === '') { // Use strict equality (good practice)
+        defaultPath = 'n/a';
+      }
+
+      generatedSchema.properties[key] = {
+        type: 'object',
+        title: supportedValues[key]['name'],
+        properties: {
+          enabled: {
+            title: 'Enabled',
+            type: 'boolean',
+            default: false
+          },
+          path: {
+            type: 'string',
+            title: 'Use data from this path',
+            description: 'Leave blank to use default (' + defaultPath + ')',
+            default: defaultPath
+          },
+          source: {
+            type: 'string',
+            title: 'Use data only from this source (leave blank if path has only one source)'
+          }
+        }
+      };
+    });
+
+    // You can uncomment this line to debug the final schema object if needed
+    // app.debug('Generated schema: %j', generatedSchema);
+    return generatedSchema; // Return the complete schema object
+  };
+
+
+
+	function padd(n, p, c)
+	{
+	  var pad_char = typeof c !== 'undefined' ? c : '0';
+	  var pad = new Array(1 + p).join(pad_char);
+	  return (pad + n).slice(-pad.length);
+	}
+	
+	
+	function radToDeg(radians) {
+	  return radians * 180 / Math.PI
+	}
+	
+	function signedRadToDeg(radians) {
+	  let deg = radians * 180 / Math.PI
+	  if (deg < 0) {
+	    deg = 360 + deg
+	  }
+	  return deg
+	}
+	
+	function radToHex(rad) {
+	  return intToHex(Math.trunc(rad*10000))
+	}
+	
+	function signedRadToHex(rad) {
+	  if (rad < 0) {
+	    rad = (2*Math.PI) + rad
+	  }
+	  return intToHex(Math.trunc(rad*10000))
+	}
+	
+	function degToHex(degrees) {
+	  return radToHex(degToRad(degrees))
+	}
+	
+	function degToRad(degrees) {
+	  return degrees * (Math.PI/180.0);
+	}
+	
+	function intToHex(integer) {
+		var hex = padd((integer & 0xff).toString(16), 2) + "," + padd(((integer >> 8) & 0xff).toString(16), 2)
+	  return hex
+	}
+	
+	function intTo4BHex(integer) {
+		var hex = padd((integer & 0xff).toString(16), 2) + "," + padd(((integer >> 8) & 0xff).toString(16), 2) + "," + padd(((integer >> 16)& 0xff).toString(16), 2) + "," + padd(((integer >> 24) & 0xff).toString(16), 2)
+	  return hex;
+	}
+
   function sendPerformance() {  
     var performancePGN_2 = ""  
     var length = 0  
@@ -668,9 +1044,7 @@ module.exports = function (app) {
               break  
   
           }  
-        }  
-          
-  
+        }       
       }  
     }  
   
@@ -684,303 +1058,11 @@ module.exports = function (app) {
           // app.debug('Msg: paddding performancePGN_2: %s  length: %d', performancePGN_2, length)  
         }  
       }  
-      let msg = util.format(performancePGN + performancePGN_2, (new Date()).toISOString(), sourceAddress, String(length))  
-      sendN2k(msg)  
+      // Only format the base header, then append the payload string
+      let msg = util.format(performancePGN, (new Date()).toISOString(), currentAddress, String(length)) + performancePGN_2;
+      sendN2k(msg);
     }  
   }  
   
-
-
-  let lastIdentityBroadcast = 0;
-  let identitySeqCounter = 0; // Dynamic tracking counter (0-7 loop)
-
-  // Clean, isolated helper routine for Strategy A identity streaming
-  function streamIdentityFrames(srcAddress) {
-    try {
-      const timestamp = new Date().toISOString();
-
-      // A. ISO Address Claim (PGN 60928) - Solid single frame
-      const rawAddressClaim = `${timestamp},6,60928,${srcAddress},255,8,50,06,82,04,00,82,00,c0`;
-
-      // B. Aligned Product Information (PGN 126996) - Fixed static sequence loop (base 20-2b)
-      // This matches your working baseline data length exactly!
-      const rawProductInfo = [
-        `${timestamp},6,126996,${srcAddress},255,8,20,35,08,c6,11,48,35,30`, // "H50"
-        `${timestamp},6,126996,${srcAddress},255,8,21,30,30,20,43,50,55,00`, // "00 CPU\0"
-        `${timestamp},6,126996,${srcAddress},255,8,22,00,00,00,00,00,00,00`, 
-        `${timestamp},6,126996,${srcAddress},255,8,23,00,00,00,00,31,2e,30`, // "1.0"
-        `${timestamp},6,126996,${srcAddress},255,8,24,2e,32,39,00,00,00,00`, // ".29\0"
-        `${timestamp},6,126996,${srcAddress},255,8,25,00,00,00,00,50,65,72`, // "Per"
-        `${timestamp},6,126996,${srcAddress},255,8,26,66,6f,72,6d,61,6e,63`, // "formance"
-        `${timestamp},6,126996,${srcAddress},255,8,27,65,20,76,32,00,00,00`, // " v2\0"
-        `${timestamp},6,126996,${srcAddress},255,8,28,00,00,00,00,42,4b,54`, // "BKT"
-        `${timestamp},6,126996,${srcAddress},255,8,29,2d,31,36,31,36,00,00`, // "-1616\0"
-        `${timestamp},6,126996,${srcAddress},255,8,2a,00,00,00,00,00,00,01`,
-        `${timestamp},6,126996,${srcAddress},255,4,2b,01,00,00`
-      ];
-
-      if (app.emit) {
-        app.emit('nmea2000out', rawAddressClaim);
-        
-        // Output the 12 fast-packet rows with precise 7ms spacing
-        rawProductInfo.forEach((frame, idx) => {
-          setTimeout(() => {
-            app.emit('nmea2000out', frame);
-          }, 10 + (idx * 7));
-        });
-      }
-      
-      app.debug(`Strategy A: Identity transmission flight dispatched for Address ${srcAddress}`);
-    } catch (identityErr) {
-      app.error(`Identity registration failure: ${identityErr.message}`);
-    }
-  }
-  // Core sendN2k routing strictly for live performance calculations
-  function sendN2k (msg) {
-    if (!msg || msg.includes('undefined')) {
-      return;
-    }
-
-    const mode = globalOptions.emulationMode || 'standard'
-
-    if (mode === 'canbus') {
-      if (simpleCan && typeof simpleCan.sendPGN === 'function') {
-        simpleCan.sendPGN(msg)
-      } else {
-        app.error('SimpleCan is not active or initialised')
-      }
-    } 
-    else if (mode === 'ydwg02' || mode === 'standard') {
-      if (app.emit) {
-        app.emit('nmea2000out', msg);
-      } else {
-        app.error('app.emit is completely unavailable in this sandboxed server context')
-      }
-    }
-  }
-
-
-  function updateSchema() {  
-    Object.keys(supportedValues).forEach(key => {  
-      let defaultPath = supportedValues[key]['defaultPath']  
-      if (defaultPath == '') {  
-        defaultPath = 'n/a'  
-      }  
-  
-      var obj =  {  
-        type: 'object',  
-        title: supportedValues[key]['name'],  
-        properties: {  
-          enabled: {  
-            title: 'Enabled',  
-            type: 'boolean',  
-            default: false  
-          },  
-          path: {  
-            type: 'string',  
-            title: 'Use data from this path',  
-            description: 'Leave blank to use default (' +defaultPath + ')',  
-            default: defaultPath  
-          },  
-          source: {  
-            type: 'string',  
-            title: 'Use data only from this source (leave blank if path has only one source)'  
-          }  
-        }  
-      }  
-      schema.properties[key] = obj;  
-    });  
-    app.debug('schema: %j', schema);  
-  }  
-  
-  updateSchema()  
-  
-  plugin.schema = function() {  
-    updateSchema()  
-    return schema  
-  }  
-  
-  
-  plugin.start = function (options, restartPlugin) {  
-    // Here we put our plugin logic  
-    app.debug('Plugin started')  
-    globalOptions = options  
-    app.debug('Options: %s', JSON.stringify(globalOptions))  
-  
-    // Determine emulation mode (support legacy 'emulate' option)
-    let mode = options.emulationMode || 'standard'
-    
-    // Handle legacy emulate boolean option
-    if (options.emulate === true && mode === 'standard') {
-      mode = 'canbus'
-      app.debug('Using legacy emulate option, setting mode to canbus')
-    }
-    
-    app.debug('Emulation mode: %s', mode)
-    sourceAddress = options.sourceAddress || 14
-  
-    if (mode === 'canbus') {
-      // Direct CANbus emulation mode
-      const SimpleCan = require('@canboat/canboatjs').SimpleCan  
-      app.debug('Using direct CANbus mode with device id: %d', sourceAddress)  
-  
-      var deviceAddress  
-      var canDevice  
-  
-	    if (typeof options.candevice != 'undefined' && options.candevice != "") {  
-	      canDevice = options.candevice  
-	      app.debug('Using configured canDevice: %s', canDevice)  
-	    } else {  
-	      // app.debug('%j', app.config.settings.pipedProviders)  
-	      app.debug('Trying to detect canDevice')  
-	      app.config.settings.pipedProviders.forEach(provider => {  
-	        if (provider.enabled == true) {  
-	          provider.pipeElements.forEach(element => {  
-	            if (element.type == 'providers/canbus' && typeof deviceAddress == 'undefined') {  
-	              app.debug('Found provider/canbus')  
-	              if (typeof element.options.canDevice != 'undefined') {  
-		              app.debug('element.options.canDevice: %s', element.options.canDevice)  
-	                canDevice = element.options.canDevice  
-	              }  
-	            }  
-	          })  
-	        }  
-	      })  
-      }  
-  
-	    simpleCan = new SimpleCan({  
-	      app,  
-	      canDevice: canDevice,  
-	      preferredAddress: sourceAddress,  
-	      transmitPGNs: [ 126996, 65305, 130824 ],  
-	      addressClaim: {  
-	        'Unique Number': 1731561,  
-	        'Manufacturer Code': 'Navico',  
-	        'Device Function': 190,  
-	        'Device Class': 'Internal Environment',  
-	        'Device Instance Lower': 0,  
-	        'Device Instance Upper': 0,  
-	        'System Instance': 0,  
-	        'Industry Group': 'Marine'  
-	      },  
-	      productInfo: {  
-	        'NMEA 2000 Version': 2100,  
-	        'Product Code': 246,  
-	        'Model ID': 'H5000 CPU',  
-	        'Software Version Code': '2.0.45.0.29',  
-	        'Model Version': '',  
-	        'Model Serial Code': '005469',  
-	        'Certification Level': 2,  
-	        'Load Equivalency': 1  
-	      }  
-      })  
-  
-      simpleCan.start()  
-      app.setPluginStatus(`Direct CANbus mode - Connected to ${canDevice}`)  
-      app.debug('simpleCan.candevice.address: %j', simpleCan.candevice.address)  
-      deviceAddress = simpleCan.candevice.address  
-    } else if (mode === 'ydwg02') {
-      // YDWG-02 Gateway mode
-      app.setPluginStatus(`YDWG-02 Gateway mode - Using source address ${sourceAddress}`)
-      app.debug('YDWG-02 mode: Sending via nmea2000out with H5000 identity')
-    } else {
-      // Standard mode
-      app.setPluginStatus(`Standard mode - Using source address ${sourceAddress}`)
-      app.debug('Standard mode: Sending via nmea2000out')
-    }
-
-    timers.push(setInterval(() => {  
-      // 1. Always calculate and transmit live performance metrics first
-      sendPerformance();
-      
-      const mode = globalOptions.emulationMode || 'standard';
-      const srcAddress = globalOptions.sourceAddress || 55;
-
-      // 2. Safely increment our global parent tracking counter
-      identityCycleCount++;
-
-      // 3. Exactly on every 10th cycle (5 seconds), fire the Identity block
-      if ((mode === 'ydwg02' || mode === 'standard') && identityCycleCount >= 10) {
-        identityCycleCount = 0; // Clear the gate counter for the next run
-
-        // Post-Performance Delay: Anchor the identity frames exactly 50ms after the burst
-        setTimeout(() => {
-          streamIdentityFrames(srcAddress);
-        }, 50);
-      }
-    }, 500));
-      
-  }  
-  
-  
-  
-  plugin.stop = function () {  
-    // Here we put logic we need when the plugin stops  
-    app.debug('Plugin stopped')  
-    unsubscribes.forEach(f => f())  
-    unsubscribes = []  
-    timers.forEach(timer => {  
-      clearInterval(timer)  
-    })
-    
-    if (simpleCan) {
-      try {
-        simpleCan.stop()
-        app.debug('SimpleCan stopped')
-      } catch (err) {
-        app.debug('Error stopping SimpleCan: %s', err.message)
-      }
-    }
-  }  
-  
-  return plugin  
-}  
-  
-function padd(n, p, c)  
-{  
-  var pad_char = typeof c !== 'undefined' ? c : '0';  
-  var pad = new Array(1 + p).join(pad_char);  
-  return (pad + n).slice(-pad.length);  
-}  
-  
-  
-function radToDeg(radians) {  
-  return radians * 180 / Math.PI  
-}  
-  
-function signedRadToDeg(radians) {  
-  let deg = radians * 180 / Math.PI  
-  if (deg < 0) {  
-    deg = 360 + deg  
-  }  
-  return deg  
-}  
-  
-function radToHex(rad) {  
-  return intToHex(Math.trunc(rad*10000))  
-}  
-  
-function signedRadToHex(rad) {  
-  if (rad < 0) {  
-    rad = (2*Math.PI) + rad  
-  }  
-  return intToHex(Math.trunc(rad*10000))  
-}  
-  
-function degToHex(degrees) {  
-  return radToHex(degToRad(degrees))  
-}  
-  
-function degToRad(degrees) {  
-  return degrees * (Math.PI/180.0);  
-}  
-  
-function intToHex(integer) {  
-	var hex = padd((integer & 0xff).toString(16), 2) + "," + padd(((integer >> 8) & 0xff).toString(16), 2)  
-  return hex  
-}  
-  
-function intTo4BHex(integer) {  
-	var hex = padd((integer & 0xff).toString(16), 2) + "," + padd(((integer >> 8) & 0xff).toString(16), 2) + "," + padd(((integer >> 16)& 0xff).toString(16), 2) + "," + padd(((integer >> 24) & 0xff).toString(16), 2)  
-  return hex;  
-}
+  return plugin;
+};
